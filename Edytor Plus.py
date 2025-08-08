@@ -1,170 +1,269 @@
-import tkinter as tk from tkinter import filedialog, messagebox import subprocess import jedi import os import black
+import tkinter as tk
+from tkinter import filedialog, simpledialog
+import subprocess
+import threading
+import re
+import jedi
+try:
+    import black
+except ImportError:
+    black = None
 
-class PythonEditor: def init(self, root): self.root = root self.root.title("Python Editor") self.filename = None self.create_widgets() self.bind_events()
+AUTO_SAVE_INTERVAL = 5000  # ms
 
-def create_widgets(self):
-    frame = tk.Frame(self.root)
-    frame.pack(fill=tk.BOTH, expand=True)
+class PythonEditor:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Edytor Pythona")
 
-    self.indent_canvas = tk.Canvas(frame, width=20, bg="#1e1e1e", highlightthickness=0)
-    self.indent_canvas.pack(side=tk.LEFT, fill=tk.Y)
+        self.filename = None
+        self.process = None
 
-    self.line_numbers = tk.Text(
-        frame, width=4, padx=2, takefocus=0, border=0,
-        background="#282a36", foreground="#6272a4", state="disabled",
-        font=("Consolas", 12)
-    )
-    self.line_numbers.pack(side=tk.LEFT, fill=tk.Y)
+        # Text widget for code
+        self.text = tk.Text(root, wrap="none", undo=True)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    self.text = tk.Text(
-        frame, wrap=tk.NONE, font=("Consolas", 12), undo=True,
-        background="#1e1e1e", foreground="#f8f8f2", insertbackground="white"
-    )
-    self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Line numbers widget
+        self.line_numbers = tk.Text(root, width=4, padx=4, takefocus=0, border=0, background='#2b2b2b', foreground='white', state='disabled')
+        self.line_numbers.pack(side=tk.LEFT, fill=tk.Y)
 
-    self.scrollbar = tk.Scrollbar(frame, command=self.on_scrollbar)
-    self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    self.text.config(yscrollcommand=self.on_textscroll)
+        # Canvas for indent guides
+        self.canvas_indent = tk.Canvas(root, width=20, bg="#1e1e1e", highlightthickness=0)
+        self.canvas_indent.pack(side=tk.LEFT, fill=tk.Y)
 
-    self.output = tk.Text(
-        self.root, height=10, bg="#1e1e1e", fg="white",
-        font=("Consolas", 10), state="normal"
-    )
-    self.output.pack(fill=tk.X)
+        # Scrollbar
+        self.scrollbar = tk.Scrollbar(root, orient="vertical", command=self.on_scrollbar)
+        self.scrollbar.pack(side=tk.RIGHT, fill="y")
 
-def bind_events(self):
-    self.text.bind("<KeyRelease>", self.on_key_release)
-    self.text.bind("<Button-1>", self.update_line_numbers)
-    self.text.bind("<MouseWheel>", self.on_mousewheel)
-    self.root.bind("<Control-s>", lambda e: self.save_file())
-    self.root.bind("<Control-o>", lambda e: self.open_file())
-    self.root.bind("<Control-r>", lambda e: self.run_code())
-    self.text.bind("<Control-i>", lambda e: self.check_indentation_errors())
+        self.text.config(yscrollcommand=self.on_text_scroll)
+        self.line_numbers.config(yscrollcommand=self.on_text_scroll)
+        self.canvas_indent.config(yscrollcommand=self.on_text_scroll)
 
-def on_scrollbar(self, *args):
-    self.text.yview(*args)
-    self.line_numbers.yview(*args)
-    self.indent_canvas.yview(*args)
-    self.draw_indent_guides()
+        # Output area
+        self.output = tk.Text(root, height=10, bg="black", fg="lime", insertbackground="white")
+        self.output.pack(fill=tk.X)
 
-def on_textscroll(self, *args):
-    self.scrollbar.set(*args)
-    self.line_numbers.yview_moveto(args[0])
-    self.indent_canvas.yview_moveto(args[0])
-    self.draw_indent_guides()
+        # Autocomplete popup
+        self.popup = tk.Listbox(root)
 
-def on_mousewheel(self, event):
-    self.text.yview("scroll", int(-1*(event.delta/120)), "units")
-    self.line_numbers.yview("scroll", int(-1*(event.delta/120)), "units")
-    self.indent_canvas.yview("scroll", int(-1*(event.delta/120)), "units")
-    self.draw_indent_guides()
-    return "break"
+        # Key bindings
+        self.text.bind("<KeyRelease>", self.on_key_release)
+        self.text.bind("<Return>", self.smart_indent)
+        self.text.bind("<Control-space>", self.show_autocomplete)
+        self.text.bind("<Tab>", self.select_autocomplete)
+        self.text.bind("<Control-f>", self.open_search)
+        self.text.bind("<Control-Shift-F>", self.format_code)
+        self.text.bind("<Control-i>", lambda e: self.check_indentation_errors())
+        self.text.bind("<Control-z>", self.undo)
+        self.text.bind("<Control-y>", self.redo)
 
-def on_key_release(self, event=None):
-    self.update_line_numbers()
-    self.highlight_current_line()
-    self.show_autocomplete()
-    self.draw_indent_guides()
+        # Mouse and scroll events
+        self.text.bind("<Configure>", lambda e: self.draw_indent_guides())
+        self.text.bind("<Motion>", lambda e: self.draw_indent_guides())
+        self.text.bind("<MouseWheel>", self.on_mousewheel)
+        self.text.bind("<Button-1>", self.on_click)
 
-def update_line_numbers(self, event=None):
-    self.line_numbers.config(state="normal")
-    self.line_numbers.delete("1.0", tk.END)
-    line_count = self.text.index("end-1c").split(".")[0]
-    for i in range(1, int(line_count)):
-        self.line_numbers.insert(tk.END, f"{i}\n")
-    self.line_numbers.config(state="disabled")
-    self.draw_indent_guides()
+        # Syntax highlighting tags
+        self.text.tag_configure("keyword", foreground="orange")
+        self.text.tag_configure("string", foreground="lightgreen")
+        self.text.tag_configure("comment", foreground="grey")
+        self.text.tag_configure("function", foreground="cyan")
+        self.text.tag_configure("self", foreground="violet")
+        self.text.tag_configure("search", background="yellow")
+        self.text.tag_configure("indent_error", background="red")
 
-def highlight_current_line(self):
-    self.text.tag_remove("current_line", "1.0", tk.END)
-    self.text.tag_add("current_line", "insert linestart", "insert lineend+1c")
-    self.text.tag_configure("current_line", background="#2c2c2c")
-
-def show_autocomplete(self):
-    code = self.text.get("1.0", "end-1c")
-    cursor_index = self.text.index(tk.INSERT)
-    row, col = map(int, cursor_index.split("."))
-    script = jedi.Script(code, path=self.filename)
-    try:
-        completions = script.complete(line=row, column=col)
-        if completions:
-            menu = tk.Menu(self.root, tearoff=0)
-            for c in completions:
-                menu.add_command(label=c.name, command=lambda name=c.name: self.insert_completion(name))
-            menu.tk_popup(self.text.winfo_rootx(), self.text.winfo_rooty() + 20)
-    except Exception:
-        pass
-
-def insert_completion(self, name):
-    self.text.insert(tk.INSERT, name)
-
-def save_file(self):
-    if not self.filename:
-        self.filename = filedialog.asksaveasfilename(defaultextension=".py")
-    if self.filename:
-        code = self.text.get("1.0", tk.END)
-        try:
-            formatted_code = black.format_str(code, mode=black.Mode())
-            with open(self.filename, "w", encoding="utf-8") as f:
-                f.write(formatted_code)
-            self.output.insert(tk.END, f"Zapisano: {self.filename}\n")
-            self.output.see(tk.END)
-        except Exception as e:
-            self.output.insert(tk.END, f"Błąd zapisu: {e}\n")
-            self.output.see(tk.END)
-
-def open_file(self):
-    self.filename = filedialog.askopenfilename(filetypes=[("Python files", "*.py")])
-    if self.filename:
-        with open(self.filename, "r", encoding="utf-8") as f:
-            code = f.read()
-        self.text.delete("1.0", tk.END)
-        self.text.insert("1.0", code)
+        # Initialize auto-save, line numbers, and indent guides
+        self.auto_save()
         self.update_line_numbers()
         self.draw_indent_guides()
 
-def run_code(self):
-    self.save_file()
-    self.check_indentation_errors()
-    if not self.filename:
-        return
-    try:
-        result = subprocess.run([
-            "python", self.filename
-        ], capture_output=True, text=True, timeout=10)
-        self.output.insert(tk.END, result.stdout)
-        self.output.insert(tk.END, result.stderr)
-        self.output.see(tk.END)
-    except subprocess.TimeoutExpired:
-        self.output.insert(tk.END, "Błąd: przekroczono limit czasu\n")
+    def draw_indent_guides(self):
+        # Clear previous indent guides
+        self.canvas_indent.delete("all")
+        lines = int(self.text.index("end-1c").split(".")[0])
 
-def draw_indent_guides(self):
-    self.indent_canvas.delete("all")
-    code_lines = self.text.get("1.0", tk.END).splitlines()
-    try:
-        line_height = self.text.dlineinfo("1.0")[3]
-    except TypeError:
-        line_height = 20
+        for i in range(1, lines + 1):
+            line_index = f"{i}.0"
+            text = self.text.get(line_index, f"{i}.end")
+            spaces = len(text) - len(text.lstrip(' '))
+            indent_level = spaces // 4
+            if spaces == 0:
+                continue
 
-    for i, line in enumerate(code_lines):
-        indent_chars = len(line) - len(line.lstrip(" \t"))
-        indent_level = indent_chars // 4
-        y = i * line_height
-        for level in range(indent_level):
-            x = 5 + level * 8
-            self.indent_canvas.create_line(x, y, x, y + line_height, fill="#44475a")
+            # Get bounding box of the line to position the indent guides
+            bbox = self.text.bbox(line_index)
+            if not bbox:
+                continue
+            y = bbox[1]
+            line_height = bbox[3]
 
-def check_indentation_errors(self):
-    source = self.text.get("1.0", tk.END)
-    try:
-        compile(source, self.filename or "<string>", "exec")
-    except IndentationError as e:
-        self.output.insert(tk.END, f"[IndentationError] {e}\n")
-        self.output.see(tk.END)
-    except SyntaxError as e:
-        if "indent" in str(e):
-            self.output.insert(tk.END, f"[SyntaxError] {e}\n")
-            self.output.see(tk.END)
+            # Draw vertical lines for each indentation level
+            for j in range(indent_level):
+                x = 5 + j * 8
+                self.canvas_indent.create_line(x, y, x, y + line_height, fill="#444")
 
-if name == "main": root = tk.Tk() app = PythonEditor(root) root.mainloop()
+    def on_mousewheel(self, event):
+        self.text.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.line_numbers.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.canvas_indent.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.update_line_numbers()
+        self.draw_indent_guides()
+        return "break"
 
+    def on_scrollbar(self, *args):
+        self.text.yview(*args)
+        self.line_numbers.yview(*args)
+        self.canvas_indent.yview(*args)
+        self.update_line_numbers()
+        self.draw_indent_guides()
+
+    def on_text_scroll(self, *args):
+        self.scrollbar.set(*args)
+        self.line_numbers.yview_moveto(args[0])
+        self.canvas_indent.yview_moveto(args[0])
+        self.update_line_numbers()
+        self.draw_indent_guides()
+
+    def on_click(self, event):
+        self.update_line_numbers()
+        self.draw_indent_guides()
+
+    def update_line_numbers(self):
+        self.line_numbers.config(state="normal")
+        self.line_numbers.delete("1.0", tk.END)
+        line_count = int(self.text.index("end-1c").split(".")[0])
+        lines = "\n".join(str(i) for i in range(1, line_count + 1))
+        self.line_numbers.insert("1.0", lines)
+        self.line_numbers.config(state="disabled")
+
+    def auto_save(self):
+        if self.filename:
+            self.save_file()
+        self.root.after(AUTO_SAVE_INTERVAL, self.auto_save)
+
+    def new_file(self):
+        self.filename = None
+        self.text.delete("1.0", tk.END)
+        self.output.delete("1.0", tk.END)
+        self.update_title()
+
+    def open_file(self):
+        filename = filedialog.askopenfilename(filetypes=[("Python files", "*.py")])
+        if filename:
+            with open(filename, "r", encoding="utf-8") as f:
+                self.text.delete("1.0", tk.END)
+                self.text.insert("1.0", f.read())
+            self.filename = filename
+            self.update_title()
+            self.update_line_numbers()
+            self.draw_indent_guides()
+
+    def save_file(self):
+        if not self.filename:
+            self.filename = filedialog.asksaveasfilename(defaultextension=".py")
+        if self.filename:
+            with open(self.filename, "w", encoding="utf-8") as f:
+                f.write(self.text.get("1.0", tk.END))
+            self.update_title()
+
+    def update_title(self):
+        title = "Edytor Pythona"
+        if self.filename:
+            title += f" - {self.filename}"
+        self.root.title(title)
+
+    def run_code(self):
+        if self.process:
+            self.stop_code()
+
+        code = self.text.get("1.0", tk.END)
+        self.output.delete("1.0", tk.END)
+
+        def target():
+            try:
+                self.process = subprocess.Popen(
+                    ["python", "-u", "-c", code],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for line in self.process.stdout:
+                    self.output.insert(tk.END, line)
+                for line in self.process.stderr:
+                    self.output.insert(tk.END, line)
+            except Exception as e:
+                self.output.insert(tk.END, str(e))
+            finally:
+                self.process = None
+
+        threading.Thread(target=target).start()
+
+    def stop_code(self):
+        if self.process:
+            self.process.terminate()
+            self.output.insert(tk.END, "\n[Zatrzymano]\n")
+            self.process = None
+
+    def on_key_release(self, event):
+        self.highlight_syntax()
+        self.update_line_numbers()
+        self.draw_indent_guides()
+
+    def highlight_syntax(self):
+        code = self.text.get("1.0", tk.END)
+        self.text.tag_remove("keyword", "1.0", tk.END)
+        self.text.tag_remove("string", "1.0", tk.END)
+        self.text.tag_remove("comment", "1.0", tk.END)
+        self.text.tag_remove("function", "1.0", tk.END)
+        self.text.tag_remove("self", "1.0", tk.END)
+
+        for match in re.finditer(r"\b(def|class|return|if|else|elif|while|for|try|except|import|from|as|pass|with|yield|lambda|in|is|and|or|not|global|nonlocal|assert|break|continue|finally|del|raise)\b", code):
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            self.text.tag_add("keyword", start, end)
+
+        for match in re.finditer(r"#.*", code):
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            self.text.tag_add("comment", start, end)
+
+        for match in re.finditer(r"(['\"])((?:(?!\1).)*)\1", code):
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            self.text.tag_add("string", start, end)
+
+        for match in re.finditer(r"\bself\b", code):
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.end()}c"
+            self.text.tag_add("self", start, end)
+
+        for match in re.finditer(r"def\s+(\w+)", code):
+            start = f"1.0+{match.start(1)}c"
+            end = f"1.0+{match.end(1)}c"
+            self.text.tag_add("function", start, end)
+
+    def smart_indent(self, event):
+        line = self.text.get("insert linestart", "insert")
+        indent = re.match(r"\s*", line).group()
+        self.text.insert(tk.INSERT, "\n" + indent)
+        return "break"
+
+    def undo(self, event=None):
+        try:
+            self.text.edit_undo()
+        except Exception:
+            pass
+
+    def redo(self, event=None):
+        try:
+            self.text.edit_redo()
+        except Exception:
+            pass
+
+    def open_search(self, event=None):
+        pass
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PythonEditor(root)
+    root.mainloop()
