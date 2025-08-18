@@ -5,6 +5,8 @@ import os
 import re
 import sys
 import shlex
+import keyword
+import builtins
 
 # Próba zaimportowania tkinterdnd2 dla funkcji "przeciągnij i upuść"
 try:
@@ -90,22 +92,34 @@ class PythonEditor(_TkBase):
         # Ulepszone wiązania
         self.text_widget.bind("<<Modified>>", self.schedule_update)
         self.text_widget.bind("<KeyRelease>", self.handle_key_release)
-        self.text_widget.bind("<Button-1>", self.update_line_numbers)
-        self.text_widget.bind("<Configure>", self.update_line_numbers)
-        self.text_widget.bind("<MouseWheel>", self.update_line_numbers)
+        self.text_widget.bind("<Button-1>", self.update_line_numbers_and_hide_autocomplete)
+        self.text_widget.bind("<Configure>", self.update_line_numbers_and_hide_autocomplete)
+        self.text_widget.bind("<MouseWheel>", self.update_line_numbers_and_hide_autocomplete)
         self.text_widget.bind("<Key>", self.handle_key_press)
         self.text_widget.bind("<Tab>", self.handle_tab_key)
         self.text_widget.bind("<Motion>", self.highlight_matching_delimiters)
         self.text_widget.bind("<Return>", self.handle_return_key)
-        self.text_widget.bind("<Up>", lambda event: None)
-        self.text_widget.bind("<Down>", lambda event: None)
+        self.text_widget.bind("<Up>", self.handle_up_key)
+        self.text_widget.bind("<Down>", self.handle_down_key)
         self.text_widget.bind("<BackSpace>", self.handle_backspace)
         self.text_widget.bind("<Delete>", self.handle_delete)
+
+        # Autocomplete: dodatkowe skróty
+        self.text_widget.bind("<Control-space>", self.force_autocomplete)
+        self.text_widget.bind("<Escape>", self.hide_autocomplete)
 
         self.protocol("WM_DELETE_WINDOW", self.check_for_unsaved_changes)
         
         # Inicjalizacja _after_id
         self._after_id = None
+
+        # Autocomplete: stan
+        self.autocomplete_window = None
+        self.autocomplete_listbox = None
+        self.autocomplete_visible = False
+        self.autocomplete_start_index = None
+        # Zbiór słów bazowych: słowa kluczowe i wbudowane nazwy Pythona
+        self.base_autocomplete_words = set(keyword.kwlist) | set(dir(builtins))
 
     def setup_ui(self):
         """Konfiguruje interfejs użytkownika edytora."""
@@ -336,11 +350,172 @@ class PythonEditor(_TkBase):
         """Obsługuje zdarzenia zwolnienia klawisza."""
         self.update_line_numbers()
         self.highlight_syntax_and_whitespace_and_check_errors()
+        self.maybe_show_autocomplete(event)
         return None
 
     def update_line_numbers_and_hide_autocomplete(self, event=None):
         """Aktualizuje numery linii i ukrywa podpowiedzi."""
         self.update_line_numbers()
+        self.hide_autocomplete()
+        return None
+
+    def get_current_prefix(self):
+        """Zwraca (prefix, start_index) dla słowa przed kursorem."""
+        line_start = self.text_widget.index(f"{tk.INSERT} linestart")
+        to_cursor = self.text_widget.get(line_start, tk.INSERT)
+        match = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", to_cursor)
+        if not match:
+            return "", None
+        start_col = match.start()
+        start_index = f"{line_start.split('.')[0]}.{start_col}"
+        return match.group(), start_index
+
+    def maybe_show_autocomplete(self, event=None):
+        """Pokazuje/aktualizuje podpowiedzi podczas pisania."""
+        # Pokaż przy wpisywaniu liter/cyfr/underscore lub BackSpace
+        keysym = getattr(event, 'keysym', None)
+        char = getattr(event, 'char', '') or ''
+        is_typing = bool(re.match(r"^[A-Za-z0-9_]$", char)) or keysym in ("BackSpace",)
+        if not is_typing:
+            # Ukryj przy znakach kończących słowo
+            if keysym in ("space", "Return", "Escape", "Left", "Right"):
+                self.hide_autocomplete()
+            return
+
+        prefix, start_index = self.get_current_prefix()
+        if not prefix:
+            self.hide_autocomplete()
+            return
+
+        suggestions = self.build_suggestions(prefix)
+        if suggestions:
+            self.show_autocomplete_window(suggestions, start_index)
+        else:
+            self.hide_autocomplete()
+
+    def build_suggestions(self, prefix):
+        """Buduje listę podpowiedzi na podstawie treści i bazowych słów."""
+        text = self.text_widget.get("1.0", tk.END)
+        words_in_doc = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
+        candidates = (self.base_autocomplete_words | words_in_doc)
+        # Filtruj po prefiksie i odrzuć dokładne dopasowanie
+        filtered = [w for w in candidates if w.startswith(prefix) and w != prefix]
+        # Sortowanie: krótsze i alfabetycznie
+        filtered.sort(key=lambda w: (len(w), w.lower()))
+        return filtered[:200]
+
+    def show_autocomplete_window(self, suggestions, start_index):
+        """Wyświetla lub aktualizuje okno podpowiedzi przy kursorze."""
+        self.autocomplete_start_index = start_index
+        if self.autocomplete_window is None or not self.autocomplete_window.winfo_exists():
+            self.autocomplete_window = tk.Toplevel(self)
+            self.autocomplete_window.overrideredirect(True)
+            self.autocomplete_window.attributes("-topmost", True)
+            self.autocomplete_listbox = tk.Listbox(
+                self.autocomplete_window,
+                height=8,
+                activestyle='none',
+                exportselection=False,
+                border=0,
+            )
+            self.autocomplete_listbox.pack(fill="both", expand=True)
+            # Interakcje
+            self.autocomplete_listbox.bind("<Return>", self.insert_selected_autocomplete)
+            self.autocomplete_listbox.bind("<Tab>", self.insert_selected_autocomplete)
+            self.autocomplete_listbox.bind("<Double-Button-1>", self.insert_selected_autocomplete)
+            self.autocomplete_listbox.bind("<Escape>", self.hide_autocomplete)
+
+        # Kolory zgodnie z motywem
+        self.autocomplete_listbox.configure(
+            background=self.bg_color,
+            foreground=self.fg_color,
+            selectbackground=self.selection_bg,
+        )
+
+        # Ustaw pozycję przy kursorze
+        bbox = self.text_widget.bbox(self.autocomplete_start_index) or self.text_widget.bbox(tk.INSERT)
+        if bbox:
+            x, y, w, h = bbox
+            abs_x = self.text_widget.winfo_rootx() + x
+            abs_y = self.text_widget.winfo_rooty() + y + h
+            self.autocomplete_window.geometry(f"300x160+{abs_x}+{abs_y}")
+
+        # Wypełnij listę
+        self.autocomplete_listbox.delete(0, tk.END)
+        for s in suggestions:
+            self.autocomplete_listbox.insert(tk.END, s)
+        if suggestions:
+            self.autocomplete_listbox.selection_clear(0, tk.END)
+            self.autocomplete_listbox.selection_set(0)
+            self.autocomplete_listbox.activate(0)
+
+        self.autocomplete_visible = True
+        self.autocomplete_window.deiconify()
+
+    def hide_autocomplete(self, event=None):
+        """Ukrywa okno podpowiedzi."""
+        if self.autocomplete_window is not None and self.autocomplete_window.winfo_exists():
+            self.autocomplete_window.withdraw()
+        self.autocomplete_visible = False
+        return "break" if event else None
+
+    def insert_selected_autocomplete(self, event=None):
+        """Wstawia zaznaczoną podpowiedź, zastępując prefiks."""
+        if not self.autocomplete_visible or self.autocomplete_listbox is None:
+            return "break" if event else None
+        try:
+            index = self.autocomplete_listbox.curselection()[0]
+            word = self.autocomplete_listbox.get(index)
+        except Exception:
+            self.hide_autocomplete()
+            return "break" if event else None
+
+        # Zastąp prefiks
+        if self.autocomplete_start_index is not None:
+            self.text_widget.delete(self.autocomplete_start_index, tk.INSERT)
+            self.text_widget.insert(self.autocomplete_start_index, word)
+        self.hide_autocomplete()
+        self.set_unsaved_changes()
+        return "break" if event else None
+
+    def force_autocomplete(self, event=None):
+        """Wymusza wyświetlenie podpowiedzi (Ctrl+Spacja)."""
+        prefix, start_index = self.get_current_prefix()
+        if not prefix:
+            return "break"
+        suggestions = self.build_suggestions(prefix)
+        if suggestions:
+            self.show_autocomplete_window(suggestions, start_index)
+        else:
+            self.hide_autocomplete()
+        return "break"
+
+    def handle_up_key(self, event):
+        """Nawigacja w podpowiedziach strzałką w górę."""
+        if self.autocomplete_visible and self.autocomplete_listbox is not None:
+            cur = self.autocomplete_listbox.curselection()
+            idx = cur[0] if cur else 0
+            new_idx = max(0, idx - 1)
+            self.autocomplete_listbox.selection_clear(0, tk.END)
+            self.autocomplete_listbox.selection_set(new_idx)
+            self.autocomplete_listbox.activate(new_idx)
+            self.autocomplete_listbox.see(new_idx)
+            return "break"
+        return None
+
+    def handle_down_key(self, event):
+        """Nawigacja w podpowiedziach strzałką w dół."""
+        if self.autocomplete_visible and self.autocomplete_listbox is not None:
+            size = self.autocomplete_listbox.size()
+            cur = self.autocomplete_listbox.curselection()
+            idx = cur[0] if cur else -1
+            new_idx = min(size - 1, idx + 1)
+            if size > 0:
+                self.autocomplete_listbox.selection_clear(0, tk.END)
+                self.autocomplete_listbox.selection_set(new_idx)
+                self.autocomplete_listbox.activate(new_idx)
+                self.autocomplete_listbox.see(new_idx)
+            return "break"
         return None
 
     def show_popup_menu(self, event):
@@ -409,7 +584,9 @@ class PythonEditor(_TkBase):
             self.text_widget.delete(start, end)
 
     def handle_return_key(self, event):
-        """Obsługuje klawisz Enter, w tym wcięcie."""
+        """Obsługuje klawisz Enter, w tym wcięcie i akceptację autouzupełniania."""
+        if self.autocomplete_visible:
+            return self.insert_selected_autocomplete(event)
         self.set_unsaved_changes()
         line_start_index = self.text_widget.index(f"{tk.INSERT} linestart")
         line_end_index = self.text_widget.index(f"{tk.INSERT} lineend")
@@ -429,7 +606,9 @@ class PythonEditor(_TkBase):
         return "break"
 
     def handle_tab_key(self, event):
-        """Obsługuje klawisz Tab, wstawiając 4 spacje."""
+        """Obsługuje klawisz Tab: akceptuje podpowiedź lub wstawia 4 spacje."""
+        if self.autocomplete_visible:
+            return self.insert_selected_autocomplete(event)
         self.text_widget.insert(tk.INSERT, "    ")
         self.set_unsaved_changes()
         return "break"
